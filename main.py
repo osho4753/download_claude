@@ -253,9 +253,12 @@ def download(url: str, media_type: str, file_id: str) -> Path:
             {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}
         ]
     else:
-        # Prefer H.264 (avc1): AV1/VP9 in mp4 don't play in many clients (Safari, older phones).
+        # Prefer H.264 (avc1/h264): AV1, VP9 and HEVC don't play in many clients
+        # (Safari, Windows without codecs, older phones). TikTok serves combined
+        # h264/h265 files, hence the best[...] fallbacks.
         opts["format"] = (
             "bestvideo[ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]"
+            "/best[ext=mp4][vcodec^=avc1]/best[ext=mp4][vcodec^=h264]"
             "/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
         )
         opts["merge_output_format"] = "mp4"
