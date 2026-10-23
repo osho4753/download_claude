@@ -118,6 +118,12 @@ class MediaResponse(BaseModel):
     file_url: str
 
 
+class CleanupRequest(BaseModel):
+    older_than_hours: float = Field(
+        ..., ge=0, description="Delete files older than this many hours; 0 deletes everything"
+    )
+
+
 def parse_time(value: str) -> float:
     """Convert 'HH:MM:SS(.ms)', 'MM:SS' or '123.5' to seconds."""
     try:
@@ -181,37 +187,89 @@ def supabase_upload(path: Path) -> str:
     return f"{SUPABASE_URL}/storage/v1/object/public/{SUPABASE_BUCKET}/{path.name}"
 
 
+def supabase_list() -> list:
+    """All objects in the bucket as dicts: name, size (bytes), created_at (aware datetime), url."""
+    files, offset, page = [], 0, 1000
+    with httpx.Client(timeout=30) as client:
+        while True:
+            r = client.post(
+                f"{SUPABASE_URL}/storage/v1/object/list/{SUPABASE_BUCKET}",
+                headers=_sb_headers(),
+                json={"prefix": "", "limit": page, "offset": offset,
+                      "sortBy": {"column": "created_at", "order": "asc"}},
+            )
+            r.raise_for_status()
+            batch = r.json()
+            for o in batch:
+                if not o.get("id"):  # folder placeholder
+                    continue
+                files.append({
+                    "name": o["name"],
+                    "size": int((o.get("metadata") or {}).get("size") or 0),
+                    # created_at is UTC like "2026-10-23T12:34:56.789Z"; seconds precision is enough.
+                    "created_at": datetime.strptime(o["created_at"][:19], "%Y-%m-%dT%H:%M:%S")
+                    .replace(tzinfo=timezone.utc),
+                    "url": f"{SUPABASE_URL}/storage/v1/object/public/{SUPABASE_BUCKET}/{o['name']}",
+                })
+            if len(batch) < page:
+                return files
+            offset += page
+
+
+def supabase_delete(names: list) -> None:
+    with httpx.Client(timeout=60) as client:
+        for i in range(0, len(names), 1000):
+            client.request(
+                "DELETE",
+                f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}",
+                headers=_sb_headers(),
+                json={"prefixes": names[i:i + 1000]},
+            ).raise_for_status()
+
+
+def local_list() -> list:
+    return [
+        {
+            "name": f.name,
+            "size": f.stat().st_size,
+            "created_at": datetime.fromtimestamp(f.stat().st_mtime, tz=timezone.utc),
+            "url": f"/downloads/{f.name}",
+        }
+        for f in sorted(PUBLIC_DIR.iterdir(), key=lambda p: p.stat().st_mtime)
+        if f.is_file()
+    ]
+
+
+def local_delete(names: list) -> None:
+    for name in names:
+        (PUBLIC_DIR / name).unlink(missing_ok=True)
+
+
+def storage_list() -> list:
+    return supabase_list() if USE_SUPABASE else local_list()
+
+
+def storage_delete(names: list) -> None:
+    if names:
+        (supabase_delete if USE_SUPABASE else local_delete)(names)
+
+
+def delete_older_than(hours: float) -> list:
+    """Delete stored results older than `hours` (0 = all). Returns the deleted entries."""
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+    old = [f for f in storage_list() if f["created_at"] <= cutoff]
+    storage_delete([f["name"] for f in old])
+    return old
+
+
 def supabase_cleanup() -> None:
     """Delete objects older than FILE_TTL_HOURS from the bucket."""
     if FILE_TTL_HOURS <= 0:
         return
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=FILE_TTL_HOURS)
     try:
-        with httpx.Client(timeout=30) as client:
-            r = client.post(
-                f"{SUPABASE_URL}/storage/v1/object/list/{SUPABASE_BUCKET}",
-                headers=_sb_headers(),
-                json={"prefix": "", "limit": 1000, "sortBy": {"column": "created_at", "order": "asc"}},
-            )
-            r.raise_for_status()
-            # created_at is UTC like "2026-10-23T12:34:56.789Z"; seconds precision is enough.
-            old = [
-                o["name"]
-                for o in r.json()
-                if o.get("created_at")
-                and datetime.strptime(o["created_at"][:19], "%Y-%m-%dT%H:%M:%S").replace(
-                    tzinfo=timezone.utc
-                )
-                < cutoff
-            ]
-            if old:
-                client.request(
-                    "DELETE",
-                    f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}",
-                    headers=_sb_headers(),
-                    json={"prefixes": old},
-                ).raise_for_status()
-                log.info("Deleted %d expired file(s) from Supabase", len(old))
+        old = delete_older_than(FILE_TTL_HOURS)
+        if old:
+            log.info("Deleted %d expired file(s) from Supabase", len(old))
     except Exception:
         log.exception("Supabase cleanup failed")
 
@@ -435,6 +493,56 @@ def health():
         "cookies": bool(COOKIES_FILE and Path(COOKIES_FILE).is_file()),
         "js_runtime": shutil.which("deno") is not None,
         "youtube_via_apify": YOUTUBE_VIA_APIFY if APIFY_TOKEN else "off",
+    }
+
+
+def _mb(size: int) -> float:
+    return round(size / (1024 * 1024), 2)
+
+
+def _storage_call(fn, *args):
+    try:
+        return fn(*args)
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"Storage error: {e}")
+
+
+@app.get("/api/files", dependencies=[Depends(verify_api_key)])
+def list_files():
+    files = _storage_call(storage_list)
+    return {
+        "storage": "supabase" if USE_SUPABASE else "local",
+        "count": len(files),
+        "total_mb": _mb(sum(f["size"] for f in files)),
+        "files": [
+            {"name": f["name"], "size_mb": _mb(f["size"]),
+             "created_at": f["created_at"].isoformat(), "url": f["url"]}
+            for f in reversed(files)  # newest first
+        ],
+    }
+
+
+@app.delete("/api/files/{name}", dependencies=[Depends(verify_api_key)])
+def delete_file(name: str):
+    if "/" in name or "\\" in name or name.startswith("."):
+        raise HTTPException(status_code=422, detail="Invalid file name")
+    if name not in {f["name"] for f in _storage_call(storage_list)}:
+        raise HTTPException(status_code=404, detail="File not found")
+    _storage_call(storage_delete, [name])
+    return {"status": "deleted", "name": name}
+
+
+@app.post("/api/cleanup", dependencies=[Depends(verify_api_key)])
+def cleanup(req: CleanupRequest):
+    deleted = _storage_call(delete_older_than, req.older_than_hours)
+    remaining = _storage_call(storage_list)
+    log.info("Cleanup older_than_hours=%s: deleted %d file(s)", req.older_than_hours, len(deleted))
+    return {
+        "status": "ok",
+        "deleted": len(deleted),
+        "freed_mb": _mb(sum(f["size"] for f in deleted)),
+        "remaining": len(remaining),
+        "remaining_mb": _mb(sum(f["size"] for f in remaining)),
     }
 
 

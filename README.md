@@ -111,6 +111,24 @@ docker build --no-cache -t media-api . && docker rm -f media-api && docker run .
 
 Коды ошибок: `401` — неверный ключ, `422` — неверные параметры/таймкоды, `400` — `yt-dlp` не смог скачать, `413` — файл больше лимита Supabase, `502` — не удалось загрузить в Supabase, `500` — внутренняя ошибка.
 
+### Управление хранилищем
+
+Работает и с Supabase, и с локальной папкой. Везде нужен заголовок `X-API-Key`.
+
+| Эндпоинт | Что делает |
+|---|---|
+| `GET /api/files` | Список файлов (новые первыми): имя, размер, дата, ссылка, плюс общий объём |
+| `DELETE /api/files/{name}` | Удалить один файл по имени (например, `d736cf....mp4`) |
+| `POST /api/cleanup` `{"older_than_hours": 24}` | Удалить файлы старше N часов. `0` удаляет всё |
+
+Кроме того, при каждом запросе к `/api/process_media` автоматически удаляются файлы старше `FILE_TTL_HOURS`.
+
+```bash
+curl -H "X-API-Key: YOUR_API_KEY" https://media.example.com/api/files
+curl -X POST https://media.example.com/api/cleanup -H "X-API-Key: YOUR_API_KEY" \
+  -H "Content-Type: application/json" -d '{"older_than_hours": 0}'
+```
+
 ## Примеры cURL
 
 Видео с обрезкой:
