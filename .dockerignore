@@ -1,0 +1,8 @@
+.env
+.git
+__pycache__/
+*.pyc
+public_downloads/
+tmp_work/
+.venv/
+cookies*.txt
