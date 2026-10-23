@@ -17,5 +17,10 @@ services:
         sync: false
       - key: SUPABASE_BUCKET
         value: media
+      - key: APIFY_TOKEN
+        sync: false
+      # Render IPs are blocked by YouTube, so don't waste time trying yt-dlp first.
+      - key: YOUTUBE_VIA_APIFY
+        value: always
       - key: COOKIES_FILE
         value: /etc/secrets/cookies.txt

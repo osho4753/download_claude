@@ -17,6 +17,7 @@ import time
 import uuid
 from pathlib import Path
 from typing import Literal, Optional
+from urllib.parse import parse_qs, urlparse
 
 from datetime import datetime, timedelta, timezone
 
@@ -41,6 +42,17 @@ COOKIES_FILE = os.getenv("COOKIES_FILE", "")
 COOKIES_B64 = os.getenv("COOKIES_B64", "").strip()
 # Log yt-dlp debug output (player clients, JS runtime, HTTP errors) to stdout.
 YTDLP_VERBOSE = os.getenv("YTDLP_VERBOSE", "").lower() in ("1", "true", "yes")
+
+# YouTube blocks most datacenter IPs. With an Apify token, YouTube links can be fetched
+# via the streamers/youtube-video-downloader actor instead (paid per run, see apify.com).
+APIFY_TOKEN = os.getenv("APIFY_TOKEN", "")
+APIFY_ACTOR = os.getenv("APIFY_ACTOR", "streamers~youtube-video-downloader")
+# "always": YouTube goes straight to Apify; "fallback": try yt-dlp first, Apify on failure.
+YOUTUBE_VIA_APIFY = os.getenv("YOUTUBE_VIA_APIFY", "fallback").lower()
+APIFY_VIDEO_QUALITY = os.getenv("APIFY_VIDEO_QUALITY", "720p")
+# Audio is extracted from a video file; lower video quality = cheaper and faster, same audio.
+APIFY_AUDIO_QUALITY = os.getenv("APIFY_AUDIO_QUALITY", "360p")
+YOUTUBE_HOSTS = ("youtube.com", "youtu.be")
 # Files older than this are deleted on each request (0 = never delete).
 FILE_TTL_HOURS = float(os.getenv("FILE_TTL_HOURS", "24"))
 # Hard limit for a single download, MB (0 = no limit).
@@ -62,6 +74,8 @@ WORK_DIR.mkdir(parents=True, exist_ok=True)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("media-api")
+# httpx logs every request URL at INFO; keep tokens and noise out of the logs.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 if not API_KEY:
     log.warning("API_KEY is not set - all requests to /api/process_media will be rejected.")
@@ -228,7 +242,97 @@ class DownloadFailed(Exception):
     pass
 
 
+def is_youtube(url: str) -> bool:
+    host = (urlparse(url).hostname or "").lower()
+    return any(host == h or host.endswith("." + h) for h in YOUTUBE_HOSTS)
+
+
+def canonical_youtube_url(url: str) -> str:
+    """Strip playlist/mix params: Apify hangs on '&list=RD...' links."""
+    parsed = urlparse(url)
+    video_id = None
+    if (parsed.hostname or "").endswith("youtu.be"):
+        video_id = parsed.path.lstrip("/").split("/")[0]
+    elif parsed.path == "/watch":
+        video_id = (parse_qs(parsed.query).get("v") or [None])[0]
+    else:
+        parts = parsed.path.strip("/").split("/")
+        if len(parts) >= 2 and parts[0] in ("shorts", "live", "embed", "v"):
+            video_id = parts[1]
+    return f"https://www.youtube.com/watch?v={video_id}" if video_id else url
+
+
+def apify_download(url: str, media_type: str, file_id: str) -> Path:
+    """Download a YouTube video through Apify; for audio, convert it to mp3 locally."""
+    quality = APIFY_AUDIO_QUALITY if media_type == "audio" else APIFY_VIDEO_QUALITY
+    payload = {
+        "videos": [{"url": canonical_youtube_url(url)}],
+        "storeInKVStore": True,
+        "preferredQuality": quality,
+        "preferredFormat": "mp4",
+        "transcriptionAndSubtitle": "NONE",
+    }
+    with httpx.Client(
+        timeout=httpx.Timeout(30, read=320),
+        headers={"Authorization": f"Bearer {APIFY_TOKEN}"},
+    ) as client:
+        r = client.post(
+            f"https://api.apify.com/v2/acts/{APIFY_ACTOR}/run-sync-get-dataset-items",
+            params={"timeout": 300},
+            json=payload,
+        )
+        if r.status_code >= 400:
+            raise DownloadFailed(f"Apify run failed: {r.status_code} {r.text[:300]}")
+        items = r.json()
+        file_link = items[0].get("downloadedFileUrl") if items else None
+        if not file_link:
+            raise DownloadFailed(f"Apify returned no file: {str(items)[:300]}")
+
+        video_path = WORK_DIR / f"{file_id}.mp4"
+        with client.stream("GET", file_link, timeout=httpx.Timeout(30, read=120)) as resp:
+            resp.raise_for_status()
+            size = int(resp.headers.get("content-length") or 0)
+            if MAX_FILESIZE_MB > 0 and size > MAX_FILESIZE_MB * 1024 * 1024:
+                raise DownloadFailed(f"File is {size / 1048576:.0f} MB, limit is {MAX_FILESIZE_MB} MB")
+            with open(video_path, "wb") as f:
+                for chunk in resp.iter_bytes(1024 * 1024):
+                    f.write(chunk)
+        # The record would otherwise sit in Apify storage for ~3 days.
+        try:
+            client.delete(file_link)
+        except httpx.HTTPError:
+            pass
+
+    if media_type != "audio":
+        return video_path
+    audio_path = WORK_DIR / f"{file_id}.mp3"
+    result = subprocess.run(
+        ["ffmpeg", "-y", "-loglevel", "error", "-i", str(video_path),
+         "-vn", "-c:a", "libmp3lame", "-q:a", "2", str(audio_path)],
+        capture_output=True, text=True, timeout=600,
+    )
+    video_path.unlink(missing_ok=True)
+    if result.returncode != 0:
+        audio_path.unlink(missing_ok=True)
+        raise DownloadFailed(f"ffmpeg audio extraction failed: {result.stderr.strip()[-300:]}")
+    return audio_path
+
+
 def download(url: str, media_type: str, file_id: str) -> Path:
+    use_apify = bool(APIFY_TOKEN) and is_youtube(url)
+    if use_apify and YOUTUBE_VIA_APIFY == "always":
+        log.info("[%s] YouTube via Apify", file_id)
+        return apify_download(url, media_type, file_id)
+    try:
+        return ytdlp_download(url, media_type, file_id)
+    except DownloadFailed as e:
+        if not use_apify:
+            raise
+        log.warning("[%s] yt-dlp failed, falling back to Apify: %s", file_id, str(e)[:200])
+        return apify_download(url, media_type, file_id)
+
+
+def ytdlp_download(url: str, media_type: str, file_id: str) -> Path:
     collector = YtdlpLogCollector()
     opts = {
         "quiet": True,
@@ -330,6 +434,7 @@ def health():
         "storage": "supabase" if USE_SUPABASE else "local",
         "cookies": bool(COOKIES_FILE and Path(COOKIES_FILE).is_file()),
         "js_runtime": shutil.which("deno") is not None,
+        "youtube_via_apify": YOUTUBE_VIA_APIFY if APIFY_TOKEN else "off",
     }
 
 

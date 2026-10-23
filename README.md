@@ -16,6 +16,13 @@ FastAPI-сервис для LLM-агента: скачивает видео/ау
 | `SUPABASE_MAX_MB` | нет (50)    | Максимальный размер загружаемого файла (лимит бесплатного плана — 50 МБ)    |
 | `COOKIES_FILE`    | нет         | Путь к `cookies.txt` для `yt-dlp`, если YouTube блокирует IP сервера        |
 | `COOKIES_B64`     | нет         | Содержимое `cookies.txt` в base64 (альтернатива `COOKIES_FILE`, удобно на Render) |
+| `APIFY_TOKEN`     | нет         | Токен Apify. Если задан, YouTube скачивается через `streamers/youtube-video-downloader` |
+| `YOUTUBE_VIA_APIFY` | нет (`fallback`) | `always`: YouTube только через Apify. `fallback`: сначала `yt-dlp`, Apify при ошибке |
+| `APIFY_VIDEO_QUALITY` / `APIFY_AUDIO_QUALITY` | нет (`720p` / `360p`) | Качество, которое запрашивается у Apify. Для аудио берётся дешёвое видео, из которого извлекается mp3 |
+
+### YouTube на облачных серверах
+
+YouTube блокирует IP большинства облачных серверов (Render в том числе): ответы 403/429, и cookies это не обходят. Поэтому на Render YouTube скачивается через Apify (`YOUTUBE_VIA_APIFY=always`): примерно $0.02 за короткий ролик в 720p, на бесплатном аккаунте Apify $5 кредитов в месяц. Обрезка, mp3 и загрузка в Supabase выполняются на нашем сервере. Ограничения: один запуск Apify — максимум 5 минут, видео приходит в VP9 (не H.264).
 
 ## Деплой: Render (free) + Supabase Storage
 
