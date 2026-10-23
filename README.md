@@ -15,6 +15,7 @@ FastAPI-сервис для LLM-агента: скачивает видео/ау
 | `SUPABASE_BUCKET` | нет (`media`) | Публичный bucket. Создаётся автоматически при старте                      |
 | `SUPABASE_MAX_MB` | нет (50)    | Максимальный размер загружаемого файла (лимит бесплатного плана — 50 МБ)    |
 | `COOKIES_FILE`    | нет         | Путь к `cookies.txt` для `yt-dlp`, если YouTube блокирует IP сервера        |
+| `COOKIES_B64`     | нет         | Содержимое `cookies.txt` в base64 (альтернатива `COOKIES_FILE`, удобно на Render) |
 
 ## Деплой: Render (free) + Supabase Storage
 

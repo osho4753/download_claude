@@ -5,6 +5,8 @@ POST /api/process_media  -> downloads media via yt-dlp, optionally trims it with
                             otherwise /downloads/ on this server.
 """
 
+import base64
+import binascii
 import logging
 import mimetypes
 import os
@@ -35,6 +37,8 @@ PUBLIC_BASE_URL = (os.getenv("PUBLIC_BASE_URL") or os.getenv("RENDER_EXTERNAL_UR
 # Netscape-format cookies.txt for yt-dlp; needed when YouTube blocks datacenter IPs
 # ("Sign in to confirm you're not a bot"). On Render use a Secret File: /etc/secrets/cookies.txt
 COOKIES_FILE = os.getenv("COOKIES_FILE", "")
+# Alternative: the whole cookies.txt base64-encoded in an env var (overrides COOKIES_FILE).
+COOKIES_B64 = os.getenv("COOKIES_B64", "").strip()
 # Files older than this are deleted on each request (0 = never delete).
 FILE_TTL_HOURS = float(os.getenv("FILE_TTL_HOURS", "24"))
 # Hard limit for a single download, MB (0 = no limit).
@@ -59,6 +63,16 @@ log = logging.getLogger("media-api")
 
 if not API_KEY:
     log.warning("API_KEY is not set - all requests to /api/process_media will be rejected.")
+
+if COOKIES_B64:
+    # Kept outside WORK_DIR so cleanup_old_files() doesn't delete it.
+    _cookies_path = Path("./cookies_from_env.txt").resolve()
+    try:
+        _cookies_path.write_bytes(base64.b64decode(COOKIES_B64, validate=True))
+        COOKIES_FILE = str(_cookies_path)
+        log.info("Using cookies from COOKIES_B64")
+    except (binascii.Error, ValueError):
+        log.error("COOKIES_B64 is not valid base64 - cookies are ignored.")
 
 app = FastAPI(title="Media Downloader API", version="1.0.0")
 app.mount("/downloads", StaticFiles(directory=PUBLIC_DIR), name="downloads")

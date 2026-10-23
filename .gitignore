@@ -5,3 +5,4 @@ __pycache__/
 public_downloads/
 tmp_work/
 cookies*.txt
+cookies*.b64
