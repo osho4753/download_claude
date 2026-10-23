@@ -289,7 +289,12 @@ def on_startup() -> None:
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "storage": "supabase" if USE_SUPABASE else "local"}
+    return {
+        "status": "ok",
+        "storage": "supabase" if USE_SUPABASE else "local",
+        "cookies": bool(COOKIES_FILE and Path(COOKIES_FILE).is_file()),
+        "js_runtime": shutil.which("deno") is not None,
+    }
 
 
 # Sync `def` on purpose: FastAPI runs it in a threadpool, so blocking yt-dlp/ffmpeg
