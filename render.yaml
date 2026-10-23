@@ -8,8 +8,14 @@ services:
       - key: API_KEY
         generateValue: true
       - key: FILE_TTL_HOURS
-        value: "6"
+        value: "24"
       - key: MAX_FILESIZE_MB
         value: "300"
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_KEY
+        sync: false
+      - key: SUPABASE_BUCKET
+        value: media
       - key: COOKIES_FILE
         value: /etc/secrets/cookies.txt

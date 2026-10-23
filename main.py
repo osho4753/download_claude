@@ -1,10 +1,12 @@
 """Media download & trim API for LLM agents.
 
 POST /api/process_media  -> downloads media via yt-dlp, optionally trims it with ffmpeg,
-                            and returns a public URL under /downloads/.
+                            and returns a public URL: Supabase Storage if configured,
+                            otherwise /downloads/ on this server.
 """
 
 import logging
+import mimetypes
 import os
 import secrets
 import shutil
@@ -14,6 +16,9 @@ import uuid
 from pathlib import Path
 from typing import Literal, Optional
 
+from datetime import datetime, timedelta, timezone
+
+import httpx
 import yt_dlp
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, Request, Security
@@ -34,6 +39,15 @@ COOKIES_FILE = os.getenv("COOKIES_FILE", "")
 FILE_TTL_HOURS = float(os.getenv("FILE_TTL_HOURS", "24"))
 # Hard limit for a single download, MB (0 = no limit).
 MAX_FILESIZE_MB = int(os.getenv("MAX_FILESIZE_MB", "1024"))
+
+# Supabase Storage. If URL and key are set, results are uploaded to a public bucket
+# and the link points there (survives restarts of ephemeral hosts like Render).
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
+SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "")
+SUPABASE_BUCKET = os.getenv("SUPABASE_BUCKET", "media")
+# Free plan rejects uploads over 50 MB.
+SUPABASE_MAX_MB = float(os.getenv("SUPABASE_MAX_MB", "50"))
+USE_SUPABASE = bool(SUPABASE_URL and SUPABASE_SERVICE_KEY)
 
 PUBLIC_DIR = Path("./public_downloads").resolve()
 WORK_DIR = Path("./tmp_work").resolve()
@@ -101,10 +115,82 @@ def cleanup_old_files() -> None:
                 pass
 
 
+def _sb_headers() -> dict:
+    return {"apikey": SUPABASE_SERVICE_KEY, "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"}
+
+
+def supabase_ensure_bucket() -> None:
+    """Create the public bucket if it doesn't exist yet."""
+    with httpx.Client(timeout=30) as client:
+        r = client.get(f"{SUPABASE_URL}/storage/v1/bucket/{SUPABASE_BUCKET}", headers=_sb_headers())
+        if r.status_code == 200:
+            if not r.json().get("public"):
+                log.warning("Bucket %r is not public - returned links won't open.", SUPABASE_BUCKET)
+            return
+        r = client.post(
+            f"{SUPABASE_URL}/storage/v1/bucket",
+            headers=_sb_headers(),
+            json={"id": SUPABASE_BUCKET, "name": SUPABASE_BUCKET, "public": True},
+        )
+        if r.status_code >= 400:
+            log.error("Could not create bucket %r: %s %s", SUPABASE_BUCKET, r.status_code, r.text)
+        else:
+            log.info("Created public bucket %r", SUPABASE_BUCKET)
+
+
+def supabase_upload(path: Path) -> str:
+    content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+    with open(path, "rb") as f, httpx.Client(timeout=600) as client:
+        r = client.post(
+            f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}/{path.name}",
+            headers={**_sb_headers(), "Content-Type": content_type, "x-upsert": "true"},
+            content=f,
+        )
+    if r.status_code >= 400:
+        raise RuntimeError(f"Supabase upload failed: {r.status_code} {r.text[:300]}")
+    return f"{SUPABASE_URL}/storage/v1/object/public/{SUPABASE_BUCKET}/{path.name}"
+
+
+def supabase_cleanup() -> None:
+    """Delete objects older than FILE_TTL_HOURS from the bucket."""
+    if FILE_TTL_HOURS <= 0:
+        return
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=FILE_TTL_HOURS)
+    try:
+        with httpx.Client(timeout=30) as client:
+            r = client.post(
+                f"{SUPABASE_URL}/storage/v1/object/list/{SUPABASE_BUCKET}",
+                headers=_sb_headers(),
+                json={"prefix": "", "limit": 1000, "sortBy": {"column": "created_at", "order": "asc"}},
+            )
+            r.raise_for_status()
+            # created_at is UTC like "2026-10-23T12:34:56.789Z"; seconds precision is enough.
+            old = [
+                o["name"]
+                for o in r.json()
+                if o.get("created_at")
+                and datetime.strptime(o["created_at"][:19], "%Y-%m-%dT%H:%M:%S").replace(
+                    tzinfo=timezone.utc
+                )
+                < cutoff
+            ]
+            if old:
+                client.request(
+                    "DELETE",
+                    f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}",
+                    headers=_sb_headers(),
+                    json={"prefixes": old},
+                ).raise_for_status()
+                log.info("Deleted %d expired file(s) from Supabase", len(old))
+    except Exception:
+        log.exception("Supabase cleanup failed")
+
+
 def download(url: str, media_type: str, file_id: str) -> Path:
     opts = {
         "quiet": True,
         "no_warnings": True,
+        "noprogress": True,
         "noplaylist": True,
         "outtmpl": str(WORK_DIR / f"{file_id}.%(ext)s"),
     }
@@ -175,9 +261,21 @@ def trim(
         raise RuntimeError(f"ffmpeg failed: {result.stderr.strip()[-500:]}")
 
 
+@app.on_event("startup")
+def on_startup() -> None:
+    if USE_SUPABASE:
+        log.info("Storage: Supabase bucket %r", SUPABASE_BUCKET)
+        try:
+            supabase_ensure_bucket()
+        except Exception:
+            log.exception("Supabase bucket check failed")
+    else:
+        log.info("Storage: local ./public_downloads")
+
+
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {"status": "ok", "storage": "supabase" if USE_SUPABASE else "local"}
 
 
 # Sync `def` on purpose: FastAPI runs it in a threadpool, so blocking yt-dlp/ffmpeg
@@ -185,6 +283,8 @@ def health():
 @app.post("/api/process_media", response_model=MediaResponse, dependencies=[Depends(verify_api_key)])
 def process_media(req: MediaRequest, request: Request) -> MediaResponse:
     cleanup_old_files()
+    if USE_SUPABASE:
+        supabase_cleanup()
 
     start = parse_time(req.start_time) if req.start_time else None
     end = parse_time(req.end_time) if req.end_time else None
@@ -217,7 +317,25 @@ def process_media(req: MediaRequest, request: Request) -> MediaResponse:
         downloaded.unlink(missing_ok=True)
         raise HTTPException(status_code=500, detail=str(e))
 
-    base = PUBLIC_BASE_URL or str(request.base_url).rstrip("/")
-    file_url = f"{base}/downloads/{final_path.name}"
+    if USE_SUPABASE:
+        try:
+            size_mb = final_path.stat().st_size / (1024 * 1024)
+            if size_mb > SUPABASE_MAX_MB:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"Result is {size_mb:.1f} MB, storage limit is {SUPABASE_MAX_MB:.0f} MB. "
+                    "Use a shorter start_time/end_time range or media_type='audio'.",
+                )
+            file_url = supabase_upload(final_path)
+        except HTTPException:
+            raise
+        except Exception as e:
+            log.exception("[%s] upload error", file_id)
+            raise HTTPException(status_code=502, detail=str(e))
+        finally:
+            final_path.unlink(missing_ok=True)
+    else:
+        base = PUBLIC_BASE_URL or str(request.base_url).rstrip("/")
+        file_url = f"{base}/downloads/{final_path.name}"
     log.info("[%s] done -> %s", file_id, file_url)
     return MediaResponse(status="success", file_url=file_url)

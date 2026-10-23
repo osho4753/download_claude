@@ -10,6 +10,26 @@ FastAPI-сервис для LLM-агента: скачивает видео/ау
 | `PUBLIC_BASE_URL` | желательно  | Публичный адрес, например `https://media.example.com`. Если пусто — берётся из запроса |
 | `FILE_TTL_HOURS`  | нет (24)    | Через сколько часов удалять файлы (`0` — не удалять)                        |
 | `MAX_FILESIZE_MB` | нет (1024)  | Лимит размера одного скачивания (`0` — без лимита)                          |
+| `SUPABASE_URL`    | нет         | Project URL из Supabase. Если задан вместе с ключом, файлы загружаются в Supabase Storage |
+| `SUPABASE_SERVICE_KEY` | нет    | `service_role` / secret key (Project Settings → API). Только на сервере, никому не отдавать |
+| `SUPABASE_BUCKET` | нет (`media`) | Публичный bucket. Создаётся автоматически при старте                      |
+| `SUPABASE_MAX_MB` | нет (50)    | Максимальный размер загружаемого файла (лимит бесплатного плана — 50 МБ)    |
+| `COOKIES_FILE`    | нет         | Путь к `cookies.txt` для `yt-dlp`, если YouTube блокирует IP сервера        |
+
+## Деплой: Render (free) + Supabase Storage
+
+На бесплатном Render диск временный, поэтому готовые файлы загружаются в Supabase, и ссылки не пропадают, когда сервис засыпает.
+
+1. **Supabase:** создать проект на supabase.com → Project Settings → API → скопировать *Project URL* и *service_role / secret key*. Bucket `media` сервис создаст сам при первом старте.
+2. **GitHub:** залить этот репозиторий.
+3. **Render:** New → Blueprint → выбрать репозиторий (используется `render.yaml`). Render спросит `SUPABASE_URL` и `SUPABASE_SERVICE_KEY`: вставить их. `API_KEY` будет сгенерирован автоматически (смотреть в Environment).
+4. Проверить `https://<сервис>.onrender.com/health`. Должно вернуться `{"status":"ok","storage":"supabase"}`.
+
+Особенности:
+- Бесплатный Render засыпает через 15 минут без запросов. Первый запрос после паузы ждёт около минуты (разбудить можно, открыв `/health`).
+- Если результат больше `SUPABASE_MAX_MB`, сервис вернёт `413` с подсказкой сократить отрезок или взять `audio`.
+- Файлы в bucket старше `FILE_TTL_HOURS` удаляются при каждом запросе.
+- Если YouTube отвечает «Sign in to confirm you're not a bot»: экспортировать cookies из браузера (расширение «Get cookies.txt LOCALLY») и добавить в Render как Secret File с именем `cookies.txt`.
 
 ## Запуск на сервере (Docker)
 
@@ -81,7 +101,7 @@ docker build --no-cache -t media-api . && docker rm -f media-api && docker run .
 }
 ```
 
-Коды ошибок: `401` — неверный ключ, `422` — неверные параметры/таймкоды, `400` — `yt-dlp` не смог скачать, `500` — внутренняя ошибка.
+Коды ошибок: `401` — неверный ключ, `422` — неверные параметры/таймкоды, `400` — `yt-dlp` не смог скачать, `413` — файл больше лимита Supabase, `502` — не удалось загрузить в Supabase, `500` — внутренняя ошибка.
 
 ## Примеры cURL
 
