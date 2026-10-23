@@ -39,6 +39,8 @@ PUBLIC_BASE_URL = (os.getenv("PUBLIC_BASE_URL") or os.getenv("RENDER_EXTERNAL_UR
 COOKIES_FILE = os.getenv("COOKIES_FILE", "")
 # Alternative: the whole cookies.txt base64-encoded in an env var (overrides COOKIES_FILE).
 COOKIES_B64 = os.getenv("COOKIES_B64", "").strip()
+# Log yt-dlp debug output (player clients, JS runtime, HTTP errors) to stdout.
+YTDLP_VERBOSE = os.getenv("YTDLP_VERBOSE", "").lower() in ("1", "true", "yes")
 # Files older than this are deleted on each request (0 = never delete).
 FILE_TTL_HOURS = float(os.getenv("FILE_TTL_HOURS", "24"))
 # Hard limit for a single download, MB (0 = no limit).
@@ -200,11 +202,39 @@ def supabase_cleanup() -> None:
         log.exception("Supabase cleanup failed")
 
 
+class YtdlpLogCollector:
+    """Keeps yt-dlp warnings/errors so a failure can explain itself in the API response."""
+
+    def __init__(self) -> None:
+        self.lines: list = []
+
+    def debug(self, msg: str) -> None:
+        if YTDLP_VERBOSE and not msg.startswith("[download]"):
+            log.info("yt-dlp: %s", msg)
+
+    def info(self, msg: str) -> None:
+        pass
+
+    def warning(self, msg: str) -> None:
+        log.warning("yt-dlp: %s", msg)
+        self.lines.append(msg)
+
+    def error(self, msg: str) -> None:
+        log.error("yt-dlp: %s", msg)
+        self.lines.append(msg)
+
+
+class DownloadFailed(Exception):
+    pass
+
+
 def download(url: str, media_type: str, file_id: str) -> Path:
+    collector = YtdlpLogCollector()
     opts = {
         "quiet": True,
-        "no_warnings": True,
         "noprogress": True,
+        "logger": collector,
+        "verbose": YTDLP_VERBOSE,
         "noplaylist": True,
         "outtmpl": str(WORK_DIR / f"{file_id}.%(ext)s"),
     }
@@ -233,6 +263,9 @@ def download(url: str, media_type: str, file_id: str) -> Path:
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             ydl.download([url])
+    except yt_dlp.utils.DownloadError as e:
+        warnings = [w for w in collector.lines if w not in str(e)][-5:]
+        raise DownloadFailed(" | ".join([str(e), *warnings])) from e
     finally:
         if cookies_copy:
             cookies_copy.unlink(missing_ok=True)
@@ -318,7 +351,7 @@ def process_media(req: MediaRequest, request: Request) -> MediaResponse:
 
     try:
         downloaded = download(req.url, req.media_type, file_id)
-    except yt_dlp.utils.DownloadError as e:
+    except DownloadFailed as e:
         raise HTTPException(status_code=400, detail=f"Download failed: {e}")
     except Exception as e:
         log.exception("[%s] download error", file_id)
