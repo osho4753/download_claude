@@ -111,6 +111,17 @@ docker build --no-cache -t media-api . && docker rm -f media-api && docker run .
 
 Коды ошибок: `401` — неверный ключ, `422` — неверные параметры/таймкоды, `400` — `yt-dlp` не смог скачать, `413` — файл больше лимита Supabase, `502` — не удалось загрузить в Supabase, `500` — внутренняя ошибка.
 
+### Загрузка своего файла
+
+`POST /api/upload`, заголовок `X-API-Key`, тело `multipart/form-data` с полем `file`. Файл кладётся туда же, куда и скачанные (Supabase или `/downloads/`), ответ такой же: `{"status": "success", "file_url": "..."}`. Файл удаляется через `FILE_TTL_HOURS`, как и остальные.
+
+- Форматы: видео `mp4 mov webm mkv m4v`, аудио `mp3 m4a aac wav ogg opus flac`, картинки `jpg jpeg png gif webp`. Другие форматы вернут `415`
+- Лимит: `SUPABASE_MAX_MB` (50 МБ) с Supabase, `MAX_FILESIZE_MB` без него. Если больше, вернётся `413`. Пустой файл вернёт `422`
+
+```bash
+curl -X POST https://media.example.com/api/upload -H "X-API-Key: YOUR_API_KEY" -F "file=@clip.mp4"
+```
+
 ### Управление хранилищем
 
 Работает и с Supabase, и с локальной папкой. Везде нужен заголовок `X-API-Key`.

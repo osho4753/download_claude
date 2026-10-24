@@ -3,6 +3,7 @@
 POST /api/process_media  -> downloads media via yt-dlp, optionally trims it with ffmpeg,
                             and returns a public URL: Supabase Storage if configured,
                             otherwise /downloads/ on this server.
+POST /api/upload         -> stores an uploaded file the same way and returns its public URL.
 """
 
 import base64
@@ -24,7 +25,7 @@ from datetime import datetime, timedelta, timezone
 import httpx
 import yt_dlp
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException, Request, Security
+from fastapi import Depends, FastAPI, File, HTTPException, Request, Security, UploadFile
 from fastapi.security import APIKeyHeader
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -66,6 +67,13 @@ SUPABASE_BUCKET = os.getenv("SUPABASE_BUCKET", "media")
 # Free plan rejects uploads over 50 MB.
 SUPABASE_MAX_MB = float(os.getenv("SUPABASE_MAX_MB", "50"))
 USE_SUPABASE = bool(SUPABASE_URL and SUPABASE_SERVICE_KEY)
+
+# Extensions accepted by /api/upload.
+UPLOAD_EXTENSIONS = {
+    ".mp4", ".mov", ".webm", ".mkv", ".m4v",
+    ".mp3", ".m4a", ".aac", ".wav", ".ogg", ".opus", ".flac",
+    ".jpg", ".jpeg", ".png", ".gif", ".webp",
+}
 
 PUBLIC_DIR = Path("./public_downloads").resolve()
 WORK_DIR = Path("./tmp_work").resolve()
@@ -496,6 +504,28 @@ def health():
     }
 
 
+def publish(final_path: Path, request: Request, file_id: str, too_big_hint: str) -> str:
+    """Upload a finished file to Supabase (deleting the local copy) or serve it from /downloads."""
+    if not USE_SUPABASE:
+        base = PUBLIC_BASE_URL or str(request.base_url).rstrip("/")
+        return f"{base}/downloads/{final_path.name}"
+    try:
+        size_mb = final_path.stat().st_size / (1024 * 1024)
+        if size_mb > SUPABASE_MAX_MB:
+            raise HTTPException(
+                status_code=413,
+                detail=f"Result is {size_mb:.1f} MB, storage limit is {SUPABASE_MAX_MB:.0f} MB. {too_big_hint}",
+            )
+        return supabase_upload(final_path)
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.exception("[%s] upload error", file_id)
+        raise HTTPException(status_code=502, detail=str(e))
+    finally:
+        final_path.unlink(missing_ok=True)
+
+
 def _mb(size: int) -> float:
     return round(size / (1024 * 1024), 2)
 
@@ -585,25 +615,45 @@ def process_media(req: MediaRequest, request: Request) -> MediaResponse:
         downloaded.unlink(missing_ok=True)
         raise HTTPException(status_code=500, detail=str(e))
 
+    file_url = publish(final_path, request, file_id,
+                       "Use a shorter start_time/end_time range or media_type='audio'.")
+    log.info("[%s] done -> %s", file_id, file_url)
+    return MediaResponse(status="success", file_url=file_url)
+
+
+@app.post("/api/upload", response_model=MediaResponse, dependencies=[Depends(verify_api_key)])
+def upload_file(request: Request, file: UploadFile = File(...)) -> MediaResponse:
+    cleanup_old_files()
     if USE_SUPABASE:
-        try:
-            size_mb = final_path.stat().st_size / (1024 * 1024)
-            if size_mb > SUPABASE_MAX_MB:
-                raise HTTPException(
-                    status_code=413,
-                    detail=f"Result is {size_mb:.1f} MB, storage limit is {SUPABASE_MAX_MB:.0f} MB. "
-                    "Use a shorter start_time/end_time range or media_type='audio'.",
-                )
-            file_url = supabase_upload(final_path)
-        except HTTPException:
-            raise
-        except Exception as e:
-            log.exception("[%s] upload error", file_id)
-            raise HTTPException(status_code=502, detail=str(e))
-        finally:
-            final_path.unlink(missing_ok=True)
-    else:
-        base = PUBLIC_BASE_URL or str(request.base_url).rstrip("/")
-        file_url = f"{base}/downloads/{final_path.name}"
+        supabase_cleanup()
+
+    suffix = Path(file.filename or "").suffix.lower()
+    if suffix not in UPLOAD_EXTENSIONS:
+        raise HTTPException(
+            status_code=415,
+            detail=f"Unsupported file type {suffix or '(none)'}. Allowed: {', '.join(sorted(UPLOAD_EXTENSIONS))}",
+        )
+    limit_mb = SUPABASE_MAX_MB if USE_SUPABASE else MAX_FILESIZE_MB
+    file_id = uuid.uuid4().hex
+    final_path = PUBLIC_DIR / f"{file_id}{suffix}"
+
+    # Copy in chunks so an oversized upload is rejected without filling the disk.
+    size = 0
+    try:
+        with open(final_path, "wb") as out:
+            while chunk := file.file.read(1024 * 1024):
+                size += len(chunk)
+                if limit_mb and size > limit_mb * 1024 * 1024:
+                    raise HTTPException(status_code=413, detail=f"File is larger than {limit_mb:.0f} MB")
+                out.write(chunk)
+    except BaseException:
+        final_path.unlink(missing_ok=True)
+        raise
+    if size == 0:
+        final_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=422, detail="Empty file")
+
+    log.info("[%s] upload %r %.2f MB", file_id, file.filename, size / (1024 * 1024))
+    file_url = publish(final_path, request, file_id, "Upload a smaller file.")
     log.info("[%s] done -> %s", file_id, file_url)
     return MediaResponse(status="success", file_url=file_url)
